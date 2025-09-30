@@ -11,7 +11,7 @@ pip install diffusers transformers accelerate opencv-python configargparse
 
 ## Run
 ```
-python main.py
+python main.py --datadir ./data/lineart --outputdir ./results --num_frames 12 --prompt "anime girl, clean lineart, full body, dynamic pose" --negative_prompt "low quality, blurry" --controlnet_strength 1.0 --easing ease-in-out --contrast 1.2 --sharpness 1.1
 ```
 
 ## Citation
