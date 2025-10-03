@@ -1,128 +1,73 @@
-import math
-from PIL import Image, ImageEnhance
 import torch
-from diffusers import (
-    StableDiffusionControlNetPipeline,
-    ControlNetModel,
-    DDIMScheduler
-)
+import torchvision.transforms as T
+from diffusers import UNet3DConditionModel, AutoencoderKL, DDPMScheduler
+from transformers import CLIPVisionModel, CLIPImageProcessor
+from PIL import Image
+import torch.nn as nn
 
-# イージング関数定義
-def linear(t): return t
-def ease_in(t): return t * t
-def ease_out(t): return 1 - (1 - t) * (1 - t)
-def ease_in_out(t): return -(math.cos(math.pi * t) - 1) / 2
+class TimeReversalPipeline:
+    def __init__(self, unet, vae, scheduler, image_encoder, device=None):
+        self.unet = unet
+        self.vae = vae
+        self.scheduler = scheduler
+        self.image_encoder = image_encoder
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-EASING_FUNCTIONS = {
-    "linear": linear,
-    "ease-in": ease_in,
-    "ease-out": ease_out,
-    "ease-in-out": ease_in_out,
-}
+        encoder_hidden_dim = getattr(self.unet.config, "encoder_hid_dim", 1024)
+        clip_output_dim = self.image_encoder.config.projection_dim
+        self.encoder_hidden_proj = nn.Linear(clip_output_dim, encoder_hidden_dim).to(self.device, dtype=torch.float32)
 
+    def _encode_image(self, image):
+        if isinstance(image, Image.Image):
+            image = self.image_processor(images=image, return_tensors="pt")["pixel_values"].to(self.device, dtype=torch.float32)
+        outputs = self.image_encoder(image)
+        return outputs.image_embeds
 
-class TimeReversalInterpolator:
-    """
-    線画アニメ補間専用パイプライン
-    - 最初と最後のフレームはオリジナルの線画を保存
-    - 中間フレームは動的thresholdを用いた線画補間を経て ControlNet で生成
-    """
+    def __call__(self, image_1, image_2, s_churn=0.0, M=8, t0=5, decode_chunk_size=8, generator=None):
+        device = self.device
+        dtype = torch.float32
 
-    def __init__(self, model_id="runwayml/stable-diffusion-v1-5", controlnet_id="lllyasviel/sd-controlnet-scribble",
-                 torch_dtype=torch.float32, device=None, controlnet_strength=1.0):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # 1. Transform images
+        resize_transform = T.Compose([T.Resize((320, 576)), T.ToTensor()])
+        image_tensor_1 = resize_transform(image_1).unsqueeze(0).to(device, dtype=dtype)
+        image_tensor_2 = resize_transform(image_2).unsqueeze(0).to(device, dtype=dtype)
+        image_tensor_1 = 2.0 * image_tensor_1 - 1.0
+        image_tensor_2 = 2.0 * image_tensor_2 - 1.0
 
-        # ControlNet とパイプラインの準備
-        self.controlnet = ControlNetModel.from_pretrained(
-            controlnet_id,
-            torch_dtype=torch_dtype
-        ).to(self.device)
+        # 2. VAE encode
+        latents_1 = self.vae.encode(image_tensor_1).latent_dist.sample().unsqueeze(2)
+        latents_2 = self.vae.encode(image_tensor_2).latent_dist.sample().unsqueeze(2)
 
-        self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
-            model_id,
-            controlnet=self.controlnet,
-            torch_dtype=torch_dtype,
-            safety_checker=None
-        ).to(self.device)
+        # 3. Interpolate latents
+        latent_sequence = [(1 - i / (M - 1)) * latents_1 + (i / (M - 1)) * latents_2 for i in range(M)]
+        latents = torch.cat(latent_sequence, dim=2).to(dtype)
 
-        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
-        self.controlnet_strength = controlnet_strength
+        # 4. Interpolate embeddings
+        embedding_1 = self._encode_image(image_1)
+        embedding_2 = self._encode_image(image_2)
+        interpolated_embeddings = [(1 - i / (M - 1)) * embedding_1 + (i / (M - 1)) * embedding_2 for i in range(M)]
+        encoder_hidden_states = torch.cat(interpolated_embeddings, dim=0)  # (M, D)
+        encoder_hidden_states = self.encoder_hidden_proj(encoder_hidden_states).to(dtype)
+        encoder_hidden_states = encoder_hidden_states.unsqueeze(0)  # (1, M, D)
 
-    def preprocess_image(self, image, contrast_factor=1.0, sharpness_factor=1.0):
-        """線画強調のための前処理"""
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(contrast_factor)
-        enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(sharpness_factor)
-        return image
+        # 5. Noise prediction
+        t = torch.tensor([t0], dtype=torch.long, device=device)
+        noise_pred = self.unet(
+            latents, t.expand(latents.shape[0]), encoder_hidden_states=encoder_hidden_states
+        ).sample
 
-    def _extract_lines(self, image: Image.Image, threshold: int = 128) -> Image.Image:
-        """二値化で線画を抽出"""
-        gray = image.convert("L")
-        binary = gray.point(lambda p: 255 if p > threshold else 0)
-        return binary
+        # 6. Denoising step
+        latents = self.scheduler.step(noise_pred, t0, latents).prev_sample
 
-    def _interpolate_lines(self, img1: Image.Image, img2: Image.Image, t: float) -> Image.Image:
-        """動的thresholdを用いた線画補間"""
-        def lerp(a: float, b: float, t: float) -> float:
-            return a + (b - a) * t
+        # 7. Decode
+        decoded = []
+        for i in range(0, M, decode_chunk_size):
+            chunk = latents[:, :, i:i+decode_chunk_size, :, :]  # (1, 4, chunk, H, W)
+            vae_input = chunk.squeeze(0).permute(1, 0, 2, 3)  # (chunk, 4, H, W)
+            recon = self.vae.decode(vae_input.to(dtype=torch.float32)).sample.to(dtype)
+            recon = (recon / 2 + 0.5).clamp(0, 1)
+            decoded.extend(recon)
 
-        # 時間に応じて A/B の線の強調度を変化
-        thresholdA = int(lerp(100, 150, t))  # Aはだんだん薄く
-        thresholdB = int(lerp(150, 100, t))  # Bはだんだん濃く
-
-        lines1 = self._extract_lines(img1, thresholdA)
-        lines2 = self._extract_lines(img2, thresholdB)
-
-        blended = Image.blend(lines1, lines2, t)
-        return blended.convert("RGB")
-
-    def interpolate_images(
-        self,
-        image_1: Image.Image,
-        image_2: Image.Image,
-        num_frames: int,
-        prompt: str,
-        negative_prompt: str = "",
-        contrast: float = 1.0,
-        sharpness: float = 1.0,
-        easing: str = "linear",
-        steps: int = 30,
-        output_callback=None,
-    ):
-        """
-        線画補間のメイン処理
-        - image_1 と image_2 の間を num_frames で補間
-        - 各フレームを output_callback(i, result) で返す
-        """
-
-        image_1 = self.preprocess_image(image_1.convert("RGB"), contrast, sharpness)
-        image_2 = self.preprocess_image(image_2.convert("RGB"), contrast, sharpness)
-
-        easing_fn = EASING_FUNCTIONS.get(easing.lower(), linear)
-
-        for i in range(num_frames):
-            t = i / (num_frames - 1)
-            eased_t = easing_fn(t)
-
-            if i == 0:
-                # 最初はオリジナル線画
-                result = image_1
-            elif i == num_frames - 1:
-                # 最後もオリジナル線画
-                result = image_2
-            else:
-                # 中間は線画補間 → ControlNet
-                interpolated_line = self._interpolate_lines(image_1, image_2, eased_t)
-                result = self.pipe(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    image=interpolated_line,
-                    controlnet_conditioning_scale=self.controlnet_strength,
-                    num_inference_steps=steps
-                ).images[0]
-
-            if output_callback:
-                output_callback(i, result)
-
-        return True
+        pil_images = [T.ToPILImage()(frame.cpu()) for frame in decoded]
+        return type("Result", (), {"frames": [pil_images]})()
